@@ -1,0 +1,10 @@
+# archive output (created in the consuming project, but ignore if run here)
+elf-archive/
+
+# python
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.venv/

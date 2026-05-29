@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "idf-devtools"
+version = "0.1.0"
+description = "Project-agnostic host-side tools for ESP-IDF / ESP32 development (ELF archiving for coredumps, NVS parsing, flash helpers)"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "Apache-2.0" }
+# core tools need only the stdlib + the `zstd` CLI; these cover the optional ones.
+dependencies = []
+
+[project.optional-dependencies]
+provision = ["littlefs-python"]
+serial = ["pyserial"]
+
+[project.scripts]
+elf-archive = "elf_archive:main"
+nvs-dump = "nvs_dump:main"
+provision = "provision:main"
+
+[tool.setuptools]
+py-modules = ["elf_archive", "elf_archive_ext", "nvs_dump", "provision", "rts"]
