@@ -14,6 +14,7 @@ common deps); nothing here is tied to a specific firmware.
 | `nvs_dump.py` | Parse/inspect an ESP32 NVS partition binary. | stdlib |
 | `flash-diff.sh` | Incremental `esptool write_flash --diff-with`, offsets read from `flasher_args.json`. | `esptool ≥ 5.2` |
 | `provision.py` | Build a LittleFS image from a config dir and write it with `parttool.py`. | `littlefs-python` |
+| `peek_symbols.py` | Resolve a firmware symbol (`name[.field][+off]`) to an address, or list symbols. DWARF member access. | `pyelftools` (member access only) |
 | `rts.py` | Pulse a serial port's RTS line (board reset). | `pyserial` |
 
 ## ELF archive + coredump workflow
