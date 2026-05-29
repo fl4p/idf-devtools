@@ -56,7 +56,13 @@ OTA pushers can archive directly: `import elf_archive; elf_archive.archive(name,
 ## Install
 
 No install needed — run the scripts directly. Optionally `pip install -e .`
-puts `elf-archive`, `nvs-dump`, and `provision` on `PATH`.
+puts `elf-archive`, `nvs-dump`, `provision`, and `peek-symbols` on `PATH`.
+
+## Tests
+
+`python3 -m unittest test_elf_archive` covers the archiver logic (dedup,
+retention pruning, coredump sha auto-match, artifact derivation, round-trip).
+Needs the `zstd` CLI; CI runs it on every push.
 
 ## License
 
