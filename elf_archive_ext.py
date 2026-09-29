@@ -34,7 +34,7 @@ def _archive(global_args):
 
 
 def action_extensions(base_actions, project_path):
-    overrides = {}
+    # Wrap the stock callbacks in place: IDF 6 rejects extensions that redefine existing actions.
     for name in ('flash', 'app-flash'):
         base = base_actions.get('actions', {}).get(name)
         if not base or 'callback' not in base:
@@ -47,5 +47,5 @@ def action_extensions(base_actions, project_path):
                 _archive(global_args)
             return wrapped
 
-        overrides[name] = dict(base, callback=make(orig))
-    return {'actions': overrides}
+        base['callback'] = make(orig)
+    return {'version': '1', 'actions': {}}
