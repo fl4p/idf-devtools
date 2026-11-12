@@ -6,6 +6,7 @@ need it skip if it's absent).
 
     python3 -m unittest test_elf_archive
 """
+import hashlib
 import json
 import os
 import shutil
@@ -85,13 +86,31 @@ class ElfArchiveTest(unittest.TestCase):
 
     @unittest.skipUnless(HAVE_ZSTD, "zstd CLI not installed")
     def test_extract_roundtrip(self):
-        sha = "22" * 32
         payload = b"\x7fELF" + os.urandom(4096)
+        sha = hashlib.sha256(payload).hexdigest()  # app_elf_sha256 = sha256(ELF)
         elf = self._write("fw.elf", payload)
         bin = self._write("fw.bin", make_bin(sha))
         ea.archive("dev", "serial", elf=elf, bin=bin, background=False)
         out = ea.extract(sha, os.path.join(self.tmp, "out.elf"))
         self.assertEqual(open(out, "rb").read(), payload)
+        # a 16-hex prefix (what the firmware's RTC record carries) also works
+        out = ea.extract(sha[:16], os.path.join(self.tmp, "out2.elf"))
+        self.assertEqual(open(out, "rb").read(), payload)
+
+    @unittest.skipUnless(HAVE_ZSTD, "zstd CLI not installed")
+    def test_extract_rejects_wrong_elf(self):
+        # blob whose ELF does not hash to the recorded sha
+        sha = "22" * 32
+        elf = self._write("fw.elf", b"\x7fELF" + os.urandom(64))
+        bin = self._write("fw.bin", make_bin(sha))
+        ea.archive("dev", "serial", elf=elf, bin=bin, background=False)
+        with self.assertRaises(ea.ShaMismatch):
+            ea.extract(sha, os.path.join(self.tmp, "bad.elf"))
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "bad.elf")))
+        # same first 8 hex, different build: must not select this blob
+        with self.assertRaises(ea.ShaMismatch):
+            ea.extract("22222222" + "33" * 4)
+        self.assertIsNone(ea.lookup(sha="22222222" + "33" * 4))
 
     # --- retention pruning ------------------------------------------------
     def test_prune_keeps_newest(self):
@@ -116,6 +135,9 @@ class ElfArchiveTest(unittest.TestCase):
         core = os.path.join(self.tmp, "core.bin")
         open(core, "wb").write(b"\x00" * 100 + bytes.fromhex(sha) + b"\xff" * 50)
         self.assertEqual(ea.sha_from_core(core), sha)
+        # the ELF-format core stores it as 64 hex characters
+        open(core, "wb").write(b"\x00" * 100 + sha.encode() + b"\xff" * 50)
+        self.assertEqual(ea.sha_from_core(core), sha)
         # a core with no known sha matches nothing
         open(core, "wb").write(b"\x5a" * 200)
         self.assertIsNone(ea.sha_from_core(core))
@@ -130,6 +152,8 @@ class ElfArchiveTest(unittest.TestCase):
                                           version="v", sha=sha)) + "\n")
         # blob must exist for sha lookup to resolve
         open(os.path.join(ea.BLOBS_DIR, "bbbbbbbb.elf.zst"), "wb").close()
+        json.dump({"sha": "bb" * 32}, open(os.path.join(ea.BLOBS_DIR, "bbbbbbbb.json"), "w"))
+        self.assertEqual(ea.lookup(sha="bb" * 8), "bb" * 32)
         self.assertEqual(ea.lookup(device="flat"), "bb" * 32)
         self.assertEqual(ea.lookup(device="flat", at="2026-01-02T00:00:00"), "aa" * 32)
 

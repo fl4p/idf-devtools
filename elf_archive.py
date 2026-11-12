@@ -9,8 +9,13 @@ coredump. So we:
 
   - dedup archived ELFs by that sha (one zstd-compressed copy per unique build),
   - log every flash as a (time, device, method, version, sha) index line, and
-  - match a core back to its ELF by finding the sha's 32 raw bytes in the dump
-    (format-agnostic), falling back to "latest build flashed to <device>".
+  - match a core back to its ELF by finding the sha in the dump, as 32 raw
+    bytes or as the 64 lower-case hex characters the ELF-format core stores
+    (``CONFIG_APP_RETRIEVE_LEN_ELF_SHA``). "Latest build flashed to <device>"
+    is used only when asked for with --device/--at, and says so.
+
+``app_elf_sha256`` is the SHA-256 of the ELF file itself, so ``extract`` hashes
+what it decompresses and refuses a blob that is not the build it claims to be.
 
 Artifacts (``<build>/<project>.elf`` / ``.bin``) are read from
 ``<build>/project_description.json`` so this works in any ESP-IDF project; pass
@@ -27,11 +32,12 @@ CLI:
                                    [--elf P] [--bin P] [--at ISO] [--foreground]
   elf_archive.py list   [--device D]
   elf_archive.py find    --device D [--at ISO] | --sha SHA   # extract ELF to a tmp path
-  elf_archive.py decode [--device D] [--at ISO] <core.bin>   # auto-match + esp-coredump
+  elf_archive.py decode [--sha S | --device D [--at ISO]] <core.bin>  # match + esp-coredump
 """
 import argparse
 import datetime
 import glob
+import hashlib
 import json
 import os
 import struct
@@ -123,7 +129,6 @@ def archive(device, method='ota', elf=None, bin=None, when=None, version=None,
     if not desc or set(bytes.fromhex(desc['sha'])) == {0}:
         # No usable sha (e.g. .bin missing) — fall back to hashing the ELF so we
         # still dedup, but core auto-matching by sha won't work for this build.
-        import hashlib
         h = hashlib.sha256(open(elf, 'rb').read()).hexdigest()
         desc = (desc or {}) | dict(sha=h)
         print(f'WARN: no app_elf_sha256 in {bin}; keyed by ELF content hash '
@@ -185,8 +190,22 @@ def prune(keep=KEEP_BUILDS):
             print(f'pruned build {sha8} (retention cap {keep})')
 
 
+def _meta_sha(sha):
+    """Full sha recorded for the blob that `sha` (a hex prefix of >= 8 chars)
+    would select, or None. Blobs are keyed by sha[:8] only, so the caller's
+    whole prefix must agree with the recorded sha, not just its first 8."""
+    sha = (sha or '').lower()
+    if len(sha) < 8:
+        return None
+    p = os.path.join(BLOBS_DIR, f'{sha[:8]}.json')
+    if not os.path.exists(p):
+        return None
+    full = json.load(open(p)).get('sha', '').lower()
+    return full if full.startswith(sha) else None
+
+
 def _blob_for_sha(sha):
-    p = os.path.join(BLOBS_DIR, f'{sha[:8]}.elf.zst')
+    p = os.path.join(BLOBS_DIR, f'{sha[:8].lower()}.elf.zst')
     return p if os.path.exists(p) else None
 
 
@@ -194,7 +213,8 @@ def lookup(device=None, at=None, sha=None):
     """Resolve a flash event -> its blob sha. If `sha` given, use it directly.
     Else pick the latest entry for `device` with ts <= `at` (or the latest)."""
     if sha:
-        return sha if _blob_for_sha(sha) else None
+        full = _meta_sha(sha)
+        return full if full and _blob_for_sha(full) else None
     rows = _read_index()
     if device:
         rows = [r for r in rows if r['device'] == device]
@@ -207,20 +227,35 @@ def lookup(device=None, at=None, sha=None):
 
 
 def sha_from_core(core_path):
-    """Best-effort: return the archived build sha whose 32 raw sha bytes appear
-    in the coredump (the dump embeds app_elf_sha256), else None."""
+    """Return the archived build sha that appears in the coredump, else None.
+    The dump embeds app_elf_sha256: the ELF-format core as 64 hex characters
+    (CONFIG_APP_RETRIEVE_LEN_ELF_SHA=64), other formats as the 32 raw bytes.
+    Both are searched."""
     data = open(core_path, 'rb').read()
-    for name in os.listdir(BLOBS_DIR) if os.path.isdir(BLOBS_DIR) else []:
+    for name in sorted(os.listdir(BLOBS_DIR)) if os.path.isdir(BLOBS_DIR) else []:
         if not name.endswith('.json'):
             continue
-        sha = json.load(open(os.path.join(BLOBS_DIR, name)))['sha']
-        if set(bytes.fromhex(sha)) != {0} and bytes.fromhex(sha) in data:
+        sha = json.load(open(os.path.join(BLOBS_DIR, name)))['sha'].lower()
+        raw = bytes.fromhex(sha)
+        if set(raw) == {0}:
+            continue
+        if raw in data or sha.encode() in data or sha.upper().encode() in data:
             return sha
     return None
 
 
-def extract(sha, dest=None):
-    """Decompress an archived ELF to `dest` (or a tmp file). Returns the path."""
+class ShaMismatch(Exception):
+    pass
+
+
+def extract(sha, dest=None, verify=True):
+    """Decompress an archived ELF to `dest` (or a tmp file). Returns the path.
+    `sha` may be a prefix (>= 8 hex chars); all of it must match the recorded
+    sha. With `verify`, the decompressed ELF must hash to the recorded sha
+    (app_elf_sha256 is sha256 of the ELF file), else ShaMismatch."""
+    full = _meta_sha(sha)
+    if full is None and os.path.exists(os.path.join(BLOBS_DIR, f'{sha[:8].lower()}.json')):
+        raise ShaMismatch(f'archived build {sha[:8]} is not {sha}')
     blob = _blob_for_sha(sha)
     if not blob:
         if os.path.exists(os.path.join(BLOBS_DIR, f'{sha[:8]}.elf.zst.tmp')):
@@ -231,6 +266,12 @@ def extract(sha, dest=None):
         os.close(fd)
     with open(dest, 'wb') as out:
         subprocess.run(['zstd', '-dc', blob], stdout=out, check=True)
+    if verify and full:
+        h = hashlib.sha256(open(dest, 'rb').read()).hexdigest()
+        if h != full:
+            os.unlink(dest)
+            raise ShaMismatch(f'archived ELF {blob} hashes to {h[:16]}, '
+                              f'not the recorded {full[:16]}')
     return dest
 
 
@@ -294,19 +335,42 @@ def main():
         if not sha:
             print('no matching archived ELF', file=sys.stderr)
             return 1
-        print(extract(sha, args.out))
+        try:
+            print(extract(sha, args.out))
+        except ShaMismatch as e:
+            print(e, file=sys.stderr)
+            return 1
         return 0
 
     if args.cmd == 'decode':
-        sha = args.sha or sha_from_core(args.core) or lookup(args.device, args.at)
+        in_core = sha_from_core(args.core)
+        if args.sha:
+            sha, how = lookup(sha=args.sha), 'sha'
+            if sha and in_core and in_core != sha:
+                print(f'--sha {args.sha[:16]} disagrees with the sha in the core '
+                      f'({in_core[:16]})', file=sys.stderr)
+                return 1
+        elif in_core:
+            sha, how = in_core, 'sha-in-core'
+        elif args.device or args.at:
+            sha = lookup(args.device, args.at)
+            how = f'device={args.device} at={args.at or "latest"}'
+            print('WARNING: no archived sha found in the core; guessing the ELF from '
+                  'the flash history. esp-coredump will reject it if it is wrong.',
+                  file=sys.stderr)
+        else:
+            sha, how = None, ''
         if not sha:
             print('could not match this core to an archived ELF '
-                  '(try --device/--at or --sha)', file=sys.stderr)
+                  '(pass --sha, or --device/--at to guess from the flash history)',
+                  file=sys.stderr)
             return 1
-        how = 'sha-in-core' if (not args.sha and sha == sha_from_core(args.core)) else \
-              'sha' if args.sha else f'device={args.device}'
         print(f'matched build {sha[:8]} ({how})', file=sys.stderr)
-        elf = extract(sha)
+        try:
+            elf = extract(sha)
+        except (ShaMismatch, FileNotFoundError) as e:
+            print(e, file=sys.stderr)
+            return 1
         try:
             return subprocess.run(['esp-coredump', 'info_corefile',
                                    '--core-format', args.core_format,
