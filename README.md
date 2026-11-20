@@ -51,7 +51,9 @@ OTA pushers can archive directly: `import elf_archive; elf_archive.archive(name,
 
 ### Config (env)
 - `ELF_ARCHIVE_DIR` — archive location (default: the first `elf-archive/` with an
-  `index.jsonl` in the cwd, its parents or this script's parents, else `./elf-archive`).
+  `index.jsonl`, owned by you and not group/world-writable, in the cwd or its parents up to
+  the git repo root, then likewise from this script (the superproject when vendored),
+  else `./elf-archive`).
 - `ELF_ARCHIVE_DEVICE` — device label for the index (the hook also honors `FUGU_DEVICE`).
 - `ELF_ARCHIVE_KEEP` — retention cap, builds (default 30).
 - `ELF_ARCHIVE_KEEP_PER_DEVICE` — builds always kept per device (default 3).
