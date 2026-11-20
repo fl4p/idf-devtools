@@ -19,8 +19,12 @@ what it decompresses and refuses a blob that is not the build it claims to be.
 
 Artifacts (``<build>/<project>.elf`` / ``.bin``) are read from
 ``<build>/project_description.json`` so this works in any ESP-IDF project; pass
-``--elf``/``--bin`` to override. The archive lives at ``$ELF_ARCHIVE_DIR`` (else
-``./elf-archive``), so it sits next to the project, not this script.
+``--elf``/``--bin`` to override. The archive lives at ``$ELF_ARCHIVE_DIR``, else the
+first ``elf-archive/`` holding an index in the cwd, its parents or the parents of
+this script (the superproject when vendored), else ``./elf-archive``.
+
+Retention keeps the ``$ELF_ARCHIVE_KEEP`` (30) most recently flashed builds plus
+the last ``$ELF_ARCHIVE_KEEP_PER_DEVICE`` (3) builds of every device.
 
 Layout (under the archive dir):
   blobs/<sha8>.elf.zst   one zstd -19 ELF per unique build
@@ -40,17 +44,37 @@ import glob
 import hashlib
 import json
 import os
+import re
 import struct
 import subprocess
 import sys
 import tempfile
 
-ARCHIVE_DIR = os.environ.get('ELF_ARCHIVE_DIR') or os.path.join(os.getcwd(), 'elf-archive')
+
+
+def _find_archive_dir():
+    def parents(p):
+        p = os.path.abspath(p)
+        while True:
+            yield p
+            up = os.path.dirname(p)
+            if up == p:
+                return
+            p = up
+    for base in [*parents(os.getcwd()), *parents(os.path.dirname(os.path.abspath(__file__)))]:
+        d = os.path.join(base, 'elf-archive')
+        if os.path.exists(os.path.join(d, 'index.jsonl')):
+            return d
+    return os.path.join(os.getcwd(), 'elf-archive')
+
+
+ARCHIVE_DIR = os.environ.get('ELF_ARCHIVE_DIR') or _find_archive_dir()
 BLOBS_DIR = os.path.join(ARCHIVE_DIR, 'blobs')
 INDEX = os.path.join(ARCHIVE_DIR, 'index.jsonl')
 APP_DESC_MAGIC = 0xABCD5432
 ZSTD_LEVEL = '19'
 KEEP_BUILDS = int(os.environ.get('ELF_ARCHIVE_KEEP', '30'))  # prune all but the N newest builds
+KEEP_PER_DEVICE = int(os.environ.get('ELF_ARCHIVE_KEEP_PER_DEVICE', '3'))  # ...and each device's last N
 
 
 def default_artifacts(build_dir='build'):
@@ -168,19 +192,25 @@ def archive(device, method='ota', elf=None, bin=None, when=None, version=None,
     return entry
 
 
-def prune(keep=KEEP_BUILDS):
-    """Delete all but the `keep` most-recently-flashed builds (blob + meta).
+def prune(keep=KEEP_BUILDS, per_device=KEEP_PER_DEVICE):
+    """Delete builds (blob + meta) that are neither among the `keep`
+    most-recently-flashed nor among the last `per_device` builds of any device.
     Recency is the latest index ts referencing each sha. The index itself is
     kept intact as flash history; aged-out entries just lose their ELF."""
     if not os.path.isdir(BLOBS_DIR):
         return
     last_ts = {}
-    for r in _read_index():
+    by_dev = {}
+    for r in sorted(_read_index(), key=lambda r: r['ts'], reverse=True):
         s = r['sha'][:8]
-        if r['ts'] > last_ts.get(s, ''):
-            last_ts[s] = r['ts']
+        last_ts.setdefault(s, r['ts'])
+        d = by_dev.setdefault(r['device'], [])
+        if s not in d:
+            d.append(s)
     keep_set = {s for s, _ in sorted(last_ts.items(), key=lambda kv: kv[1],
                                      reverse=True)[:keep]}
+    for d in by_dev.values():
+        keep_set.update(d[:per_device])
     for name in os.listdir(BLOBS_DIR):
         sha8 = name.split('.', 1)[0]
         if name.endswith('.tmp') or sha8 in keep_set:
@@ -224,6 +254,13 @@ def lookup(device=None, at=None, sha=None):
         return None
     rows.sort(key=lambda r: r['ts'])
     return rows[-1]['sha']
+
+
+def core_sha_hex(data):
+    """app_elf_sha256 prefix (hex) from an ELF-format core's ESP_CORE_DUMP_INFO
+    note (stored as ASCII hex after a 4-byte version), else None."""
+    m = re.search(rb'ESP_CORE_DUMP_INFO\x00+.{4}([0-9a-f]{8,64})', data, re.S)
+    return m.group(1).decode() if m else None
 
 
 def sha_from_core(core_path):
