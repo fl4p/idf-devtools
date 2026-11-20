@@ -121,19 +121,51 @@ class ElfArchiveTest(unittest.TestCase):
         kept = sorted(n.split(".")[0] for n in os.listdir(ea.BLOBS_DIR))
         self.assertEqual(kept, ["01bbbbbb", "04bbbbbb", "05bbbbbb"])
 
-    def test_find_archive_dir_from_subdir(self):
-        root = os.path.join(self.tmp, "proj")
-        os.makedirs(os.path.join(root, "elf-archive"))
-        open(os.path.join(root, "elf-archive", "index.jsonl"), "w").close()
-        sub = os.path.join(root, "a", "b")
-        os.makedirs(sub)
-        cwd = os.getcwd()
+    def _arch(self, root, mode=0o755):
+        d = os.path.join(root, "elf-archive")
+        os.makedirs(d)
+        open(os.path.join(d, "index.jsonl"), "w").close()
+        os.chmod(d, mode)
+        return os.path.realpath(d)
+
+    def _find_from(self, cwd):
+        old = os.getcwd()
         try:
-            os.chdir(sub)
-            self.assertEqual(os.path.realpath(ea._find_archive_dir()),
-                             os.path.realpath(os.path.join(root, "elf-archive")))
-        finally:
             os.chdir(cwd)
+            return os.path.realpath(ea._find_archive_dir([cwd]))
+        finally:
+            os.chdir(old)
+
+    def _repo(self, *sub):
+        root = os.path.join(self.tmp, "proj")
+        os.makedirs(os.path.join(root, ".git"), exist_ok=True)
+        d = os.path.join(root, *sub)
+        os.makedirs(d, exist_ok=True)
+        return root, d
+
+    def test_find_archive_dir_from_subdir(self):
+        root, sub = self._repo("a", "b")
+        arch = self._arch(root)
+        self.assertEqual(self._find_from(sub), arch)
+
+    def test_find_archive_dir_through_submodule(self):
+        root, sub = self._repo("etc", "tool")
+        open(os.path.join(sub, ".git"), "w").write("gitdir: ../../.git/modules/etc/tool\n")
+        arch = self._arch(root)
+        self.assertEqual(self._find_from(sub), arch)
+
+    def test_find_archive_dir_stops_at_repo_root(self):
+        self._arch(self.tmp)  # planted above the repo / above a non-repo dir
+        _, sub = self._repo("a")
+        self.assertEqual(self._find_from(sub), os.path.realpath(os.path.join(sub, "elf-archive")))
+        x = os.path.join(self.tmp, "x")
+        os.makedirs(x)
+        self.assertEqual(self._find_from(x), os.path.realpath(os.path.join(x, "elf-archive")))
+
+    def test_find_archive_dir_skips_writable(self):
+        root, sub = self._repo("a")
+        self._arch(root, 0o777)
+        self.assertEqual(self._find_from(sub), os.path.realpath(os.path.join(sub, "elf-archive")))
 
     # --- coredump auto-match ---------------------------------------------
     def test_sha_from_elf_core_note(self):

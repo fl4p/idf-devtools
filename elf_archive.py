@@ -15,8 +15,9 @@ coredump. So we:
 Artifacts (``<build>/<project>.elf`` / ``.bin``) are read from
 ``<build>/project_description.json`` so this works in any ESP-IDF project; pass
 ``--elf``/``--bin`` to override. The archive lives at ``$ELF_ARCHIVE_DIR``, else the
-first ``elf-archive/`` holding an index in the cwd, its parents or the parents of
-this script (the superproject when vendored), else ``./elf-archive``.
+first ``elf-archive/`` holding an index (ours, not group/world-writable) in the cwd
+or its parents up to the git repo root, then likewise from this script (reaching
+the superproject when vendored), else ``./elf-archive``.
 
 Retention keeps the ``$ELF_ARCHIVE_KEEP`` (30) most recently flashed builds plus
 the last ``$ELF_ARCHIVE_KEEP_PER_DEVICE`` (3) builds of every device.
@@ -46,18 +47,40 @@ import tempfile
 
 
 
-def _find_archive_dir():
-    def parents(p):
-        p = os.path.abspath(p)
-        while True:
-            yield p
-            up = os.path.dirname(p)
-            if up == p:
-                return
-            p = up
-    for base in [*parents(os.getcwd()), *parents(os.path.dirname(os.path.abspath(__file__)))]:
+def _repo_dirs(start):
+    """`start` and its parents up to the enclosing git repo root (past submodule
+    roots to the superproject). Outside a repo: just `start`."""
+    out, p = [], os.path.abspath(start)
+    while True:
+        out.append(p)
+        g = os.path.join(p, '.git')
+        if os.path.isdir(g):
+            return out
+        if os.path.isfile(g):
+            try:
+                if '/modules/' not in open(g).read():
+                    return out
+            except OSError:
+                return out
+        up = os.path.dirname(p)
+        if up == p:
+            return out[:1]
+        p = up
+
+
+def _trusted(path):
+    st = os.stat(path)
+    return st.st_uid == os.getuid() and not st.st_mode & 0o022
+
+
+def _find_archive_dir(starts=None):
+    """First `elf-archive/` holding an index in the repo of the cwd or of this
+    script (owned by us, not group/world-writable), else ./elf-archive."""
+    starts = starts or [os.getcwd(), os.path.dirname(os.path.abspath(__file__))]
+    for base in [d for st in starts for d in _repo_dirs(st)]:
         d = os.path.join(base, 'elf-archive')
-        if os.path.exists(os.path.join(d, 'index.jsonl')):
+        idx = os.path.join(d, 'index.jsonl')
+        if os.path.exists(idx) and _trusted(d) and _trusted(idx):
             return d
     return os.path.join(os.getcwd(), 'elf-archive')
 
