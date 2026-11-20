@@ -108,7 +108,45 @@ class ElfArchiveTest(unittest.TestCase):
         self.assertEqual(kept, ["02aaaaaa", "03aaaaaa", "04aaaaaa"])
         self.assertEqual(len(ea._read_index()), 5, "index history is kept intact")
 
+    def test_prune_keeps_last_builds_per_device(self):
+        os.makedirs(ea.BLOBS_DIR)
+        with open(ea.INDEX, "w") as idx:
+            for i in range(6):
+                dev = "live" if i < 2 else "bench"
+                sha = f"{i:02d}" + "b" * 62
+                open(os.path.join(ea.BLOBS_DIR, f"{sha[:8]}.elf.zst"), "wb").close()
+                idx.write(json.dumps(dict(ts=f"2026-01-0{i+1}T00:00:00", device=dev,
+                                          method="ota", version=f"v{i}", sha=sha)) + "\n")
+        ea.prune(keep=2, per_device=1)
+        kept = sorted(n.split(".")[0] for n in os.listdir(ea.BLOBS_DIR))
+        self.assertEqual(kept, ["01bbbbbb", "04bbbbbb", "05bbbbbb"])
+
+    def test_find_archive_dir_from_subdir(self):
+        root = os.path.join(self.tmp, "proj")
+        os.makedirs(os.path.join(root, "elf-archive"))
+        open(os.path.join(root, "elf-archive", "index.jsonl"), "w").close()
+        sub = os.path.join(root, "a", "b")
+        os.makedirs(sub)
+        cwd = os.getcwd()
+        try:
+            os.chdir(sub)
+            self.assertEqual(os.path.realpath(ea._find_archive_dir()),
+                             os.path.realpath(os.path.join(root, "elf-archive")))
+        finally:
+            os.chdir(cwd)
+
     # --- coredump auto-match ---------------------------------------------
+    def test_sha_from_elf_core_note(self):
+        os.makedirs(ea.BLOBS_DIR)
+        sha = "d5" * 32
+        json.dump({"sha": sha}, open(os.path.join(ea.BLOBS_DIR, f"{sha[:8]}.json"), "w"))
+        core = os.path.join(self.tmp, "core.bin")
+        note = (struct.pack("<III", 19, 72, 0x204A) + b"ESP_CORE_DUMP_INFO\x00\x00"
+                + struct.pack("<I", 0x90104) + sha.encode() + b"\x00" * 4)
+        open(core, "wb").write(b"\xa5" * 64 + note)
+        self.assertEqual(ea.sha_from_core(core), sha)
+        self.assertEqual(ea.core_sha_hex(open(core, "rb").read()), sha)
+
     def test_sha_from_core(self):
         os.makedirs(ea.BLOBS_DIR)
         sha = "fe" * 32

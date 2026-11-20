@@ -34,10 +34,11 @@ Each unique build is stored once as `elf-archive/blobs/<sha8>.elf.zst`
 (`zstd -19`, ~3.6× smaller); every flash appends a `{ts, device, method,
 version, sha}` line to `elf-archive/index.jsonl`. Compression runs detached so
 it never blocks the flash. Retention keeps the newest `ELF_ARCHIVE_KEEP` (30)
-builds.
+builds plus the last `ELF_ARCHIVE_KEEP_PER_DEVICE` (3) builds of every device,
+so a burst of bench flashes cannot evict what another device runs.
 
 **Symbolicate a coredump** — it auto-matches the ELF by the sha embedded in the
-dump:
+dump (raw bytes, or the hex string in an ELF-format core's `ESP_CORE_DUMP_INFO` note):
 
 ```bash
 python3 elf_archive.py decode coredump.bin                # auto-match
@@ -49,9 +50,11 @@ python3 elf_archive.py find --device myboard -o fw.elf    # extract an archived 
 OTA pushers can archive directly: `import elf_archive; elf_archive.archive(name, method='ota')`.
 
 ### Config (env)
-- `ELF_ARCHIVE_DIR` — archive location (default `./elf-archive`).
+- `ELF_ARCHIVE_DIR` — archive location (default: the first `elf-archive/` with an
+  `index.jsonl` in the cwd, its parents or this script's parents, else `./elf-archive`).
 - `ELF_ARCHIVE_DEVICE` — device label for the index (the hook also honors `FUGU_DEVICE`).
 - `ELF_ARCHIVE_KEEP` — retention cap, builds (default 30).
+- `ELF_ARCHIVE_KEEP_PER_DEVICE` — builds always kept per device (default 3).
 
 ## Install
 
