@@ -1,51 +1,41 @@
+"""Dump the contents of an ESP-IDF NVS partition image.
 
+Pages are read in sequence-number order (not flash order). All entries are
+collected first; namespace names and multi-chunk blobs are resolved
+afterwards, so a namespace definition or blob index may sit anywhere in the
+partition. Unknown namespace indices print as ``ns#<idx>``. Entries marked
+erased, entries with a bad header or data CRC and incomplete spans are
+skipped (reported on stderr).
+"""
 import argparse
-import os
 import sys
+import zlib
+from collections import namedtuple
 from enum import Enum
 
-
-# Standard page size for external SPI flash.
-# I don't know that this value could be modified anyway.
-# The design of the NVS system seems to be built around the assumption that page size = 4096 bytes.
+# Layout and constants from nvs_flash (nvs_constants.h, nvs_page.hpp, nvs_types.hpp)
 PAGE_SIZE = 4096
-
-# Page state bitmasks
-# Copied from nvs_page.hpp
-PSB_INIT = 0x01     # Page is initialized
-PSB_FULL = 0x02     # Page is full, no more NVS entries available
-PSB_FREE = 0x04     # Page is in the process of being freed (do not use this page)
-PSB_CORRUPT = 0x08  # Page is corrupt (do not use this page)
-
-# Entry state bitmasks
-# copied from nvs_page.hpp
-ESB_WRITTEN = 0x01  # This entry has been used
-ESB_ERASED = 0x02   # This entry was in use but has been erased (do not use this entry)
-
-# Offset and length of header fields within each page
-PAGE_STATE_OFFSET = 0
-PAGES_SEQ_NO_OFFSET = 4
-ESB_OFFSET = 32
-ESB_LENGTH = 32
-ENTRY_0_OFFSET = 64
+ENTRY_COUNT = 126
 ENTRY_LENGTH = 32
+ESB_OFFSET = 32
+ENTRY_0_OFFSET = 64
 
-# Offset of fields within each entry
-NS_OFFSET = 0           # Namespace identifier for this entry
-TYPE_OFFSET = 1         # Data type identifier for this entry
-SPAN_OFFSET = 2         # Number of consecutive entry fields spanned by this entry
-CHUNK_IDX_OFFSET = 3    # For use with blobs
-#CRC_OFFSET = 4         # CRC is not checked
-KEY_OFFSET = 8          # Key
+PAGE_STATE_ACTIVE = 0xFFFFFFFE
+PAGE_STATE_FULL = 0xFFFFFFFC
+PAGE_STATE_FREEING = 0xFFFFFFF8
+# Pages whose entries are live. FREEING is authoritative: IDF discards the
+# half-filled copy target and restarts the move on boot.
+LIVE_PAGE_STATES = (PAGE_STATE_ACTIVE, PAGE_STATE_FULL, PAGE_STATE_FREEING)
+
+# 2-bit entry states
+ES_EMPTY = 0x3
+ES_WRITTEN = 0x2
+ES_ERASED = 0x0
+
 KEY_LENGTH = 16
-DATA_OFFSET = 24        # Data (length is determined by data type and span)
+NS_INDEX = 0
+NS_ANY = 0xFF
 
-# Not part of NVS definition
-# Used internally by Python script
-class EntryState(Enum):
-    UNUSED = 1
-    WRITTEN = 2
-    ERASED = 3
 
 class EntryType(Enum):
     U8 = 0x01
@@ -57,310 +47,199 @@ class EntryType(Enum):
     U64 = 0x08
     I64 = 0x18
     STR = 0x21
-    BLOB = 0x42
+    BLOB = 0x41         # single-entry blob (page version 1), also the type of reassembled blobs
+    BLOB_DATA = 0x42
     BLOB_IDX = 0x48
 
-# Class used for reassambling complete BLOB data from individual chunks
-class BlobReassemblyClass:
-    def __init__(self):
-        self.size = 0
-        self.chunk_count = 0
-        self.chunk_start = 0
-        self.chunks = []
 
-    def add_chunk(self, chunk_index, data):
-        self.chunks.append( (chunk_index, data) )
+VAR_TYPES = (EntryType.STR.value, EntryType.BLOB.value, EntryType.BLOB_DATA.value)
 
-    def add_blob_index_info(self, size, chunk_count, chunk_start):
-        self.size = size
-        self.chunk_count = chunk_count
-        self.chunk_start = chunk_start
-
-    def get_reassembled_blob(self):
-        if self.size == 0:
-            print("Cannot reassemble BLOB.  Info not set.")
-            return bytearray()
-        else:
-            # Make sure list of chunks is sorted by chunk index
-            self.chunks.sort(key=lambda x:x[0])
-
-            # Sanity checks to make sure BLOB is being reassembled properly
-            if self.chunks[0][0] != self.chunk_start:
-                raise ValidationError("BLOB parsing error: Starting chunk index %d does not match chunk start value %d from BLOB index." % (self.chunks[0][0], self.chunk_start))
-                return bytearray()
-            if len(self.chunks) != self.chunk_count:
-                raise ValidationError("BLOB parsing error: Number of chunks being reassembled %d does not match chunk count %d from BLOB index." % (len(self.chunks), self.chunk_count))
-                return bytearray()
-
-            # Now reassemble the chunks.
-            # No additional checking of chunk indices is done at this point.
-            blob_data = bytearray()
-            for chunk in self.chunks:
-                blob_data.extend(chunk[1])
-
-            return blob_data
-
-
-# Keys used for SSIDs
-# These are stored as BLOBs but can be printed as strings
+# Keys used for Wi-Fi SSIDs / passwords (blobs that can be printed as strings)
 SSID_KEY_VALUES = ["sta.ssid", "ap.ssid"]
-
-# Keys used for passwords
-# These are stored as BLOBs but can be printed as strings
 PASSWORD_KEY_VALUES = ["sta.pswd", "ap.passwd"]
 
-
-# A dictionary where key = namespace name and value = namespace index
-# User to convert the index back to the namespace name, which is used as the keys for nvs_table
-ns_idx_to_name = {}
-
-# The entire NVS table is parsed into this dictionary
-# Keys = namespace name, Each value is another dictionary
-# For each namespace dictionary
-#   Key = NVS entry key, data = tuple of following format
-#      (entry type, data)
-#      where data may be integer, list, or string
-nvs_table = {}
-
-# This is organized similar to nvs_table with top level key being namespace name
-# and second level key being key value for BLOB entry.
-# It differs in that the BLOB value itself is represented by a BlobReassemblyClass, which is
-# used to collect the BLOB pieces before generating the final byte array that goes into nvs_table.
-blob_reassembly_table = {}
-
-def verify_nvs_size(input):
-    if (len(input) % PAGE_SIZE) != 0:
-        message = "Partition size (%d bytes) is not a multiple of page size (%d bytes)" % (len(input), PAGE_SIZE)
-        raise ValidationError(message)
-
-    global num_pages
-    num_pages = int(len(input) / PAGE_SIZE)
-    # print("NVS partition has %d pages" % (num_pages))
-
-
-def build_page_array(input):
-    # List of tuples
-    # Each tuple is (page_index, sequence_number)
-    # Where each page is a PAGE_SIZE-byte starting with page index 0 at beginning of file
-    global page_array
-    page_array = []
-
-    for page_index in range(num_pages):
-        page_base_address = PAGE_SIZE * page_index
-
-        page_state = int.from_bytes(input[(page_base_address+PAGE_STATE_OFFSET):(page_base_address+PAGE_STATE_OFFSET+4)], byteorder='little', signed=False)
-        seq_no = int.from_bytes(input[(page_base_address+PAGES_SEQ_NO_OFFSET):(page_base_address+PAGES_SEQ_NO_OFFSET+4)], byteorder='little', signed=False)
-
-        # print("Page %d: State=0x%08X, Seq=%d" % (page_index, page_state, seq_no))
-
-        # If page is in use...
-        if (page_state & PSB_INIT) == 0:
-            # ...and page is not corrupt or in the process of being freed
-            if (page_state & (PSB_FREE | PSB_CORRUPT)) == (PSB_FREE | PSB_CORRUPT):
-                # ...then add page to page array
-                page_array.append( (page_index, seq_no) )
-                # print("  Added this page")
-
-    # Finished scanning pages and adding them to the array
-    # Now we sort it based on sequence number
-    page_array.sort(key=lambda x:x[1])
-    # print("Page array (page index, seq number):")
-    # for e in page_array:
-    #     print(e)
-
-
-def scan_in_page(page_data, page_index):
-    entry_state_bitmap = page_data[ESB_OFFSET:(ESB_OFFSET+ESB_LENGTH)]
-
-    entry_states = []
-    for byte in entry_state_bitmap:
-        for i in range(4):
-            entry_state_bits = byte & 0x3
-            if (entry_state_bits & ESB_WRITTEN) == 0:
-                if (entry_state_bits & ESB_ERASED) == 0:
-                    entry_states.append(EntryState.ERASED)
-                else:
-                    entry_states.append(EntryState.WRITTEN)
-            else:
-                entry_states.append(EntryState.UNUSED)
-            byte >>= 2
-
-    # Only 126 entries are available since the first 64 bytes are taken up by header and entry state bitmap
-    del entry_states[126:128]
-
-    i = 0
-    while i < len(entry_states):
-        # print("Entry %d at offset %02X is %s" % (i, ENTRY_0_OFFSET + (ENTRY_LENGTH*i), entry_states[i].name))
-        if entry_states[i] == EntryState.WRITTEN:
-            entry_base = ENTRY_0_OFFSET + (ENTRY_LENGTH*i)
-            # print("Parsing entry %d at offset %02X" % (i, entry_base))
-
-            # Parse header fields for entry
-            entry_ns = page_data[entry_base+NS_OFFSET]
-            entry_type = page_data[entry_base+TYPE_OFFSET]
-            entry_span = page_data[entry_base+SPAN_OFFSET]
-            entry_chunk_idx = page_data[entry_base+CHUNK_IDX_OFFSET]
-            entry_key_data = page_data[entry_base+KEY_OFFSET:entry_base+KEY_OFFSET+KEY_LENGTH]
-
-            # Have to do some special handling here.  Simply decoding directly to string will leave in the null terminators.
-            # We have to first slice the byte array at the first null terminator.
-            if 0 in entry_key_data:
-                entry_key_data = entry_key_data[0:entry_key_data.find(0)]
-            entry_key = entry_key_data.decode('ascii')
-
-            # Read out entry data
-            # Note that for standard integer types, the enum values can be used directly and not interpreted as enums.
-            do_not_add = False
-            if entry_type < 0x20:
-                num_bytes = entry_type & 0xf
-                is_signed = False if (entry_type & 0x10) == 0 else True
-                entry_data = int.from_bytes(page_data[entry_base+DATA_OFFSET:entry_base+DATA_OFFSET+num_bytes], byteorder='little', signed=is_signed)
-
-            elif EntryType(entry_type) == EntryType.STR:
-                data_size = int.from_bytes(page_data[entry_base+DATA_OFFSET:entry_base+DATA_OFFSET+2], byteorder='little', signed=False)
-                entry_data = page_data[entry_base+DATA_OFFSET+8:entry_base+DATA_OFFSET+8+data_size].decode('ascii')
-
-            elif EntryType(entry_type) == EntryType.BLOB:
-                data_size = int.from_bytes(page_data[entry_base+DATA_OFFSET:entry_base+DATA_OFFSET+2], byteorder='little', signed=False)
-                entry_data = page_data[entry_base+DATA_OFFSET+8:entry_base+DATA_OFFSET+8+data_size]
-                namespace_name = ns_idx_to_name[entry_ns]
-                namespace_dict = blob_reassembly_table[namespace_name]
-                if entry_key not in namespace_dict:
-                    namespace_dict[entry_key] = BlobReassemblyClass()
-                namespace_dict[entry_key].add_chunk(entry_chunk_idx, entry_data)
-                # print("  Saved %d byte chunk with index %d for BLOB %s" % (len(entry_data), entry_chunk_idx, entry_key))
-                do_not_add = True   # BLOB will be added when all pieces are reassembled
-
-            elif EntryType(entry_type) == EntryType.BLOB_IDX:
-                blob_size = int.from_bytes(page_data[entry_base+DATA_OFFSET:entry_base+DATA_OFFSET+4], byteorder='little', signed=False)
-                chunk_count = int.from_bytes(page_data[entry_base+DATA_OFFSET+4:entry_base+DATA_OFFSET+5], byteorder='little', signed=False)
-                chunk_start = int.from_bytes(page_data[entry_base+DATA_OFFSET+5:entry_base+DATA_OFFSET+6], byteorder='little', signed=False)
-                namespace_name = ns_idx_to_name[entry_ns]
-                namespace_dict = blob_reassembly_table[namespace_name]
-                namespace_dict[entry_key].add_blob_index_info(blob_size, chunk_count, chunk_start)
-                # print("  Reassembling BLOB %s" % (entry_key))
-                entry_data = namespace_dict[entry_key].get_reassembled_blob()
-                entry_type = EntryType.BLOB.value   # Store into nvs_table as type BLOB
-
-            else:
-                do_not_add = True;
-                print("  Unknown entry type 0x%02X for entry %d at offset 0x%X in page %d" % (entry_type, i, entry_base, page_index))
-
-            # print("  NS = %d, type = %02X, span = %d, key = %s" % (entry_ns, entry_type, entry_span, entry_key))
-            if entry_ns == 0:
-                # print("  Added namespace %s" % (entry_key))
-                ns_idx_to_name[entry_data] = entry_key
-                nvs_table[entry_key] = {}
-                blob_reassembly_table[entry_key] = {}
-            elif do_not_add == False:
-                namespace_name = ns_idx_to_name[entry_ns]
-                namespace_dict = nvs_table[namespace_name]
-                namespace_dict[entry_key] = (entry_type, entry_data)
-                # print("  Added key %s to namespace %s" % (entry_key, namespace_name))
-
-            if entry_span > 0:
-                i += entry_span
-            else:
-                i += 1      # Failsafe - Span should never equal 0 on a valid entry.
-        else:
-            i += 1
-
-
-def parse_nvs_binary(input):
-    build_page_array(input)
-    for page in page_array:
-        page_idx = page[0]
-        seq_no = page[1]
-        # print("Parsing page %d with seq no %d" % (page_idx, seq_no))
-        page_base = page_idx * PAGE_SIZE
-        scan_in_page(input[page_base:page_base+PAGE_SIZE], page_idx)
-
-
-def entry_data_to_string(entry_key, entry_type, entry_data):
-    data_str = ''
-    if entry_type < 0x20:
-        data_str = str(entry_data)
-    elif EntryType(entry_type) == EntryType.STR:
-        data_str = entry_data
-    elif EntryType(entry_type) == EntryType.BLOB:
-        byte_count = 0
-        if special_handling:
-            handle_ssid = True if entry_key in SSID_KEY_VALUES else False
-            handle_passphrase = True if entry_key in PASSWORD_KEY_VALUES else False
-        else:
-            handle_ssid = False
-            handle_passphrase = False
-
-        if handle_ssid:
-            # Format for SSIDs is 4 bytes of length followed by string data
-            ssid_len = int.from_bytes(entry_data[0:4], byteorder='little', signed=False)
-            if ssid_len <= 32:
-                data_str = entry_data[4:4+ssid_len].decode('utf-8')
-            else:
-                data_str = ''                                           # This field is not initialized
-        elif handle_passphrase:
-            if entry_data[0] == 0xFF:
-                data_str = ''                                           # This field is not initialized
-            else:
-                # Same treatment as we did with entry keys.  Data needs to be truncated at the null terminator.
-                if 0 in entry_data:
-                    entry_data = entry_data[0:entry_data.find(0)]
-                data_str = entry_data.decode('utf-8')
-        else:
-            for data_byte in entry_data:
-                if (blob_limit>0) and (byte_count==blob_limit):
-                    data_str += '...'
-                    break
-                else:
-                    data_str += format(data_byte, "02X") + ' '
-                    byte_count += 1
-    return data_str
-
-
-def dump_nvs_data():
-    for ns_name in nvs_table:
-        ns_dict = nvs_table[ns_name]
-        print("Namespace %s" % (ns_name))
-        for entry_key in ns_dict:
-            entry_info = ns_dict[entry_key]
-
-            entry_type = entry_info[0]
-            entry_data = entry_info[1]
-
-            data_str = entry_data_to_string(entry_key, entry_type, entry_data)
-
-            print("  %-16s: %-4s  %s" % (entry_key, EntryType(entry_type).name, data_str))
-
-
-def main():
-    global blob_limit
-    global special_handling
-
-    parser = argparse.ArgumentParser(description='ESP32 NVS partition analyzer')
-    parser.add_argument('input', help='Path to binary dump of NVS partition.', type=argparse.FileType('rb'))
-    parser.add_argument('--blob_limit', '-b', help='Set maximum number of bytes to dump per BLOB (0 = no limit)', type=int, default=0)
-    parser.add_argument('--special_handling', '-s', help='Display SSID and password BLOBs as strings', action='store_true')
-    args = parser.parse_args()
-
-    blob_limit = args.blob_limit
-    special_handling = args.special_handling
-    input = args.input.read()
-    verify_nvs_size(input)
-
-    parse_nvs_binary(input)
-    dump_nvs_data()
-
+Item = namedtuple('Item', 'ns type span chunk key data payload page entry')
 
 
 class InputError(RuntimeError):
-    def __init__(self, e):
-        super(InputError, self).__init__(e)
+    pass
 
 
 class ValidationError(InputError):
     def __init__(self, message):
-        super(ValidationError, self).__init__(
-            "NVS partition invalid: %s" % (message))
+        super().__init__("NVS partition invalid: %s" % message)
+
+
+def _u(b):
+    return int.from_bytes(b, 'little')
+
+
+def _crc(*parts):
+    c = 0xFFFFFFFF
+    for p in parts:
+        c = zlib.crc32(p, c)
+    return c
+
+
+def header_crc_ok(e):
+    return _u(e[4:8]) == _crc(e[0:4], e[8:32])
+
+
+def live_pages(image):
+    """(page_index, seq, page_bytes) of all live pages, sorted by sequence number."""
+    if len(image) % PAGE_SIZE:
+        raise ValidationError("partition size (%d bytes) is not a multiple of page size (%d bytes)"
+                              % (len(image), PAGE_SIZE))
+    pages = []
+    for idx in range(len(image) // PAGE_SIZE):
+        page = image[idx * PAGE_SIZE:(idx + 1) * PAGE_SIZE]
+        if _u(page[0:4]) in LIVE_PAGE_STATES:
+            pages.append((idx, _u(page[4:8]), page))
+    pages.sort(key=lambda p: (p[1], p[0]))
+    return pages
+
+
+def entry_states(page):
+    return [(page[ESB_OFFSET + i // 4] >> (2 * (i % 4))) & 0x3 for i in range(ENTRY_COUNT)]
+
+
+def page_items(page, page_index, warn):
+    """Valid WRITTEN items of one page, in entry order."""
+    states = entry_states(page)
+    i = 0
+    while i < ENTRY_COUNT:
+        if states[i] != ES_WRITTEN:
+            i += 1
+            continue
+        base = ENTRY_0_OFFSET + i * ENTRY_LENGTH
+        e = page[base:base + ENTRY_LENGTH]
+        where = "page %d entry %d" % (page_index, i)
+        if not header_crc_ok(e):
+            warn("%s: header CRC mismatch, skipped" % where)
+            i += 1
+            continue
+        ns, typ, span, chunk = e[0], e[1], e[2], e[3]
+        key = bytes(e[8:8 + KEY_LENGTH]).split(b'\0', 1)[0].decode('ascii', 'replace')
+        data = bytes(e[24:32])
+        payload = None
+        if typ in VAR_TYPES:
+            size = _u(data[0:2])
+            if span < 1 or i + span > ENTRY_COUNT or size > (span - 1) * ENTRY_LENGTH:
+                warn("%s: bad span %d / size %d for key %r, skipped" % (where, span, size, key))
+                i += 1
+                continue
+            if any(s != ES_WRITTEN for s in states[i + 1:i + span]):
+                warn("%s: span of key %r not fully written, skipped" % (where, key))
+                i += span
+                continue
+            payload = bytes(page[base + ENTRY_LENGTH:base + ENTRY_LENGTH + size])
+            if _crc(payload) != _u(data[4:8]):
+                warn("%s: data CRC mismatch for key %r, skipped" % (where, key))
+                i += span
+                continue
+        else:
+            span = 1
+        yield Item(ns, typ, span, chunk, key, data, payload, page_index, i)
+        i += span
+
+
+def _decode_str(payload):
+    return payload.split(b'\0', 1)[0].decode('utf-8', 'replace')
+
+
+def parse_nvs(image, warn=None):
+    """Parse an NVS image into {namespace_name: {key: (type_value, value)}}.
+
+    Later pages (higher sequence number) override earlier copies of a key.
+    """
+    if warn is None:
+        def warn(msg):
+            print("warning: " + msg, file=sys.stderr)
+
+    items = [it for idx, _seq, page in live_pages(image) for it in page_items(page, idx, warn)]
+
+    ns_names = {}
+    for it in items:
+        if it.ns == NS_INDEX and it.type == EntryType.U8.value:
+            ns_names[it.data[0]] = it.key
+
+    def ns_name(idx):
+        return ns_names.get(idx, "ns#%d" % idx)
+
+    table = {ns_names[i]: {} for i in sorted(ns_names)}
+    blob_idx = {}   # (ns, key) -> (size, chunk_count, chunk_start)
+    chunks = {}     # (ns, key) -> {chunk_index: bytes}
+
+    for it in items:
+        if it.ns == NS_INDEX or it.ns == NS_ANY:
+            continue
+        ns = table.setdefault(ns_name(it.ns), {})
+        t = it.type
+        if t < 0x20 and t & 0xF in (1, 2, 4, 8):
+            n = t & 0xF
+            ns[it.key] = (t, int.from_bytes(it.data[:n], 'little', signed=bool(t & 0x10)))
+        elif t == EntryType.STR.value:
+            ns[it.key] = (t, _decode_str(it.payload))
+        elif t == EntryType.BLOB.value:
+            ns[it.key] = (t, it.payload)
+        elif t == EntryType.BLOB_DATA.value:
+            chunks.setdefault((it.ns, it.key), {})[it.chunk] = it.payload
+        elif t == EntryType.BLOB_IDX.value:
+            blob_idx[(it.ns, it.key)] = (_u(it.data[0:4]), it.data[4], it.data[5])
+            ns[it.key] = (EntryType.BLOB.value, None)
+        else:
+            warn("page %d entry %d: unknown type 0x%02X for key %r" % (it.page, it.entry, t, it.key))
+
+    for (nsi, key), (size, count, start) in blob_idx.items():
+        have = chunks.get((nsi, key), {})
+        missing = [c for c in range(start, start + count) if c not in have]
+        if missing:
+            warn("blob %s/%s: missing chunk(s) %s" % (ns_name(nsi), key, missing))
+        blob = b''.join(have.get(c, b'') for c in range(start, start + count))
+        if len(blob) != size:
+            warn("blob %s/%s: %d bytes reassembled, index says %d" % (ns_name(nsi), key, len(blob), size))
+        table[ns_name(nsi)][key] = (EntryType.BLOB.value, blob)
+
+    for (nsi, key) in chunks.keys() - blob_idx.keys():
+        warn("blob %s/%s: data chunk(s) without index" % (ns_name(nsi), key))
+
+    return table
+
+
+def entry_data_to_string(entry_key, entry_type, entry_data, blob_limit=0, special_handling=False):
+    if entry_type < 0x20:
+        return str(entry_data)
+    if entry_type == EntryType.STR.value:
+        return entry_data
+    if special_handling and entry_key in SSID_KEY_VALUES:
+        n = _u(entry_data[0:4])
+        return entry_data[4:4 + n].decode('utf-8', 'replace') if n <= 32 else ''
+    if special_handling and entry_key in PASSWORD_KEY_VALUES:
+        if not entry_data or entry_data[0] == 0xFF:
+            return ''
+        return _decode_str(entry_data)
+    shown = entry_data if blob_limit <= 0 else entry_data[:blob_limit]
+    s = ''.join('%02X ' % b for b in shown)
+    return s + '...' if len(shown) < len(entry_data) else s
+
+
+def dump_nvs_data(table, blob_limit=0, special_handling=False):
+    for ns_name, ns in table.items():
+        print("Namespace %s" % ns_name)
+        for key, (typ, value) in ns.items():
+            print("  %-16s: %-4s  %s" % (key, EntryType(typ).name,
+                                         entry_data_to_string(key, typ, value, blob_limit, special_handling)))
+
+
+def main():
+    parser = argparse.ArgumentParser(description='ESP32 NVS partition analyzer')
+    parser.add_argument('input', help='Path to binary dump of NVS partition.', type=argparse.FileType('rb'))
+    parser.add_argument('--blob_limit', '-b', help='Set maximum number of bytes to dump per BLOB (0 = no limit)',
+                        type=int, default=0)
+    parser.add_argument('--special_handling', '-s', help='Display SSID and password BLOBs as strings',
+                        action='store_true')
+    args = parser.parse_args()
+    dump_nvs_data(parse_nvs(args.input.read()), args.blob_limit, args.special_handling)
 
 
 if __name__ == '__main__':
