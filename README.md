@@ -16,6 +16,7 @@ common deps); nothing here is tied to a specific firmware.
 | `provision.py` | Build a LittleFS image from a config dir and write it with `parttool.py`. | `littlefs-python` |
 | `peek_symbols.py` | Resolve a firmware symbol (`name[.field][+off]`) to an address, or list symbols. DWARF member access. | `pyelftools` (member access only) |
 | `rts.py` | Pulse a serial port's RTS line (board reset). | `pyserial` |
+| `image_layout.py` | Where an app image's flash-mapped segments sit against the 64 KB MMU page: how far rodata may grow or shrink before the code segment moves a page (which defeats a differential OTA), and free space in the app partition. Optional checks for CI. | stdlib |
 
 ## ELF archive + coredump workflow
 
