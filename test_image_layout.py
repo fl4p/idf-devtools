@@ -1,6 +1,8 @@
 import struct
+import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -30,11 +32,46 @@ def run(tmp_path, data, *args):
 
 
 def test_slack_matches_documented_case():
-    # DROM 0x5f7e4 left 2,060 B below the page edge (doc/2026-09-08-image-layout-stability-for-ota.md)
-    segs = il.segments(image(0x5F7E4))
-    drom, irom = segs[0], segs[-1]
-    assert drom["kind"] == "DROM" and irom["kind"] == "IROM"
-    assert irom["hdr"] - drom["end"] - 8 == 2060
+    # DROM 0x5f7e4 (doc/2026-09-08-image-layout-stability-for-ota.md); esptool moves IROM at E > 0x5fffc
+    r = il.margins(0x20 + 0x5F7E4, 0x60018)
+    assert r == (2040, 0x20 + 0x5F7E4 - 0x50018 - 4)
+
+
+def test_valid_layout_at_page_start_is_not_a_failure(tmp_path):
+    # DROM ending in the first 0x18 B of the page before IROM's is a legal layout (negative margin before the fix)
+    r = run(tmp_path, image(0x4FFE4), "--expect-irom", "0x60018")
+    assert r.returncode == 0, r.stdout
+
+
+def esptool_irom_hdr(drom_len):
+    """IROM header offset as esptool itself lays out an S3 image with this DROM length."""
+    bi = pytest.importorskip("esptool.bin_image")
+    img = bi.ESP32S3FirmwareImage()
+    img.segments = [bi.ELFSection(b".flash.rodata", 0x3C100020, b"\0" * drom_len, 0),
+                    bi.ELFSection(b".dram0.data", 0x3FC90000, b"\0" * 0x6000, 0),
+                    bi.ELFSection(b".iram0.text", 0x40374000, b"\0" * 0x20000, 0),
+                    bi.ELFSection(b".flash.text", 0x42000020, b"\0" * 0x100, 0)]
+    img.entrypoint = 0x40374000
+    fd, p = tempfile.mkstemp()
+    os.close(fd)
+    try:
+        img.save(p)
+        segs = il.segments(open(p, "rb").read())
+    finally:
+        os.unlink(p)
+    return next(x["hdr"] for x in segs if x["kind"] == "IROM"), segs[0]["end"]
+
+
+@pytest.mark.parametrize("drom", [0x51C7C, 0x5F7E4, 0x5FFDC, 0x50000, 0x4FFE4, 0x4FFF8, 0x5FFF8, 0x6000C])
+def test_margins_match_esptool(drom):
+    hdr, end = esptool_irom_hdr(drom)
+    up, down = il.margins(end, hdr)
+    assert esptool_irom_hdr(drom + up)[0] == hdr
+    assert esptool_irom_hdr(drom + up + 4)[0] != hdr
+    for d in range(4, down + 1, 4) if down < 64 else (4, down // 2 & ~3, down - 4, down):
+        assert esptool_irom_hdr(drom - d)[0] == hdr, d
+    if drom - down - 4 > 0:
+        assert esptool_irom_hdr(drom - down - 4)[0] != hdr
 
 
 @pytest.mark.parametrize("drom,rc", [(0x51C7C, 0), (0x5F000, 1), (0x5FE00, 1), (0x50100, 1)])

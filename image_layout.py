@@ -62,6 +62,18 @@ def smallest_app_part(pt):
     return min(sizes) if sizes else None
 
 
+def margins(end, hdr):
+    """Bytes the previous segment (ending at file offset `end`, 4-aligned) may grow and shrink while the next
+    header stays at `hdr`. esptool (get_alignment_data_needed) puts the header in the page after the one `end`
+    is in, except when end % PAGE == hdr % PAGE, where it follows directly at `end`."""
+    if end == hdr:
+        return 0, 0
+    page = hdr - hdr % PAGE
+    up = page - 4 - end
+    down = end - (hdr - PAGE) - 4 if end > hdr - PAGE else end - (page - PAGE)
+    return up, down
+
+
 def analyse(binpath, part_size=None):
     b = open(binpath, "rb").read()
     segs = segments(b)
@@ -70,10 +82,9 @@ def analyse(binpath, part_size=None):
         raise ValueError("fewer than two flash-mapped segments")
     edges = []
     for prev, s in zip(flash, flash[1:]):
+        up, down = margins(prev["end"], s["hdr"])
         edges.append(dict(kind=s["kind"], hdr=s["hdr"], page=s["data"] // PAGE, prev_kind=prev["kind"],
-                          prev_len=prev["len"],
-                          up=s["hdr"] - prev["end"] - SEG_HDR,  # growth of prev before s moves up a page
-                          down=prev["end"] - (s["hdr"] - PAGE)))  # shrink of prev before s moves down
+                          prev_len=prev["len"], up=up, down=down))
     r: dict = dict(bin=binpath, size=len(b), segments=segs, edges=edges, part_size=part_size,
              free=part_size - len(b) if part_size else None)
     return r
@@ -99,8 +110,8 @@ def main():
                 pt = os.path.join(a.path, "partition_table", "partition-table.bin")
                 part = smallest_app_part(open(pt, "rb").read())
         r = analyse(binpath, part)
-    except (OSError, ValueError, KeyError, struct.error) as e:
-        print(f"image_layout: {e}", file=sys.stderr)
+    except Exception as e:  # anything unreadable is exit 2, never a pass or a plain check failure
+        print(f"image_layout: {type(e).__name__}: {e}", file=sys.stderr)
         return 2
     if a.min_free is not None and r["free"] is None:
         print("image_layout: --min-free needs a partition size", file=sys.stderr)
