@@ -37,7 +37,9 @@ CLI:
                                    [--elf P] [--bin P] [--at ISO] [--foreground]
   elf_archive.py list   [--device D]
   elf_archive.py find    --device D [--at ISO] | --sha SHA   # extract ELF to a tmp path
-  elf_archive.py decode [--sha S | --device D [--at ISO]] <core.bin>  # match + esp-coredump
+  elf_archive.py decode [--sha S | --device D [--at ISO]] [--search DIR] <core.bin>
+      # match + esp-coredump; without an archived match, searches the build dirs of the
+      # repo's git worktrees (and --search) for the ELF whose sha256 is in the core
 """
 import argparse
 import datetime
@@ -227,6 +229,8 @@ def prune(keep=KEEP_BUILDS, per_device=KEEP_PER_DEVICE):
     for r in sorted(_read_index(), key=lambda r: r['ts'], reverse=True):
         s = r['sha'][:8]
         last_ts.setdefault(s, r['ts'])
+        if r.get('method', '').endswith('-failed'):
+            continue  # not running on the device: no per-device slot
         d = by_dev.setdefault(r['device'], [])
         if s not in d:
             d.append(s)
@@ -268,7 +272,7 @@ def lookup(device=None, at=None, sha=None):
     if sha:
         full = _meta_sha(sha)
         return full if full and _blob_for_sha(full) else None
-    rows = _read_index()
+    rows = [r for r in _read_index() if not r.get('method', '').endswith('-failed')]
     if device:
         rows = [r for r in rows if r['device'] == device]
     if at:
@@ -296,11 +300,43 @@ def sha_from_core(core_path):
         if not name.endswith('.json'):
             continue
         sha = json.load(open(os.path.join(BLOBS_DIR, name)))['sha'].lower()
+        blob = os.path.join(BLOBS_DIR, name[:-5] + '.elf.zst')
+        if not (os.path.exists(blob) or os.path.exists(blob + '.tmp')):
+            continue  # meta left by a failed compression
         raw = bytes.fromhex(sha)
         if set(raw) == {0}:
             continue
         if raw in data or sha.encode() in data or sha.upper().encode() in data:
             return sha
+    return None
+
+
+def _search_dirs(extra=()):
+    """Build dirs of the cwd's repo and its git worktrees, plus `extra`."""
+    out = list(extra)
+    try:
+        wt = subprocess.run(['git', 'worktree', 'list', '--porcelain'], capture_output=True,
+                            text=True, timeout=10).stdout
+        roots = [l[9:] for l in wt.splitlines() if l.startswith('worktree ')]
+    except (OSError, subprocess.TimeoutExpired):
+        roots = []
+    for r in roots or [_repo_dirs(os.getcwd())[-1]]:
+        out += [os.path.join(r, 'build')] + glob.glob(os.path.join(r, 'build', '*'))
+    return [d for d in out if os.path.isdir(d)]
+
+
+def local_elf_for_core(core_path, extra=()):
+    """ELF in a local build dir whose sha256 appears in the core, else None."""
+    data = open(core_path, 'rb').read()
+    for d in _search_dirs(extra):
+        for elf in glob.glob(os.path.join(d, '*.elf')):
+            h = hashlib.sha256()
+            with open(elf, 'rb') as f:
+                for chunk in iter(lambda: f.read(1 << 20), b''):
+                    h.update(chunk)
+            hx = h.hexdigest().encode()
+            if h.digest() in data or hx in data or hx.upper() in data:
+                return elf
     return None
 
 
@@ -371,6 +407,8 @@ def main():
     d.add_argument('--at')
     d.add_argument('--sha')
     d.add_argument('--core-format', default='raw')
+    d.add_argument('--search', action='append', default=[], metavar='DIR',
+                   help='extra build dir to search when the archive has no match')
 
     args = ap.parse_args()
 
@@ -412,6 +450,14 @@ def main():
                 return 1
         elif in_core:
             sha, how = in_core, 'sha-in-core'
+        elif (elf := local_elf_for_core(args.core, args.search)):
+            print(f'matched local build {elf} (not archived; archiving it)', file=sys.stderr)
+            try:
+                archive(args.device or 'unknown', 'found-local', elf=elf, bin=elf[:-4] + '.bin')
+            except Exception as e:
+                print(f'archiving failed ({e}); decoding anyway', file=sys.stderr)
+            return subprocess.run(['esp-coredump', 'info_corefile', '--core-format',
+                                   args.core_format, '-c', args.core, elf]).returncode
         elif args.device or args.at:
             sha = lookup(args.device, args.at)
             how = f'device={args.device} at={args.at or "latest"}'
