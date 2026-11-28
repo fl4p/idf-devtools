@@ -20,9 +20,11 @@ what it decompresses and refuses a blob that is not the build it claims to be.
 Artifacts (``<build>/<project>.elf`` / ``.bin``) are read from
 ``<build>/project_description.json`` so this works in any ESP-IDF project; pass
 ``--elf``/``--bin`` to override. The archive lives at ``$ELF_ARCHIVE_DIR``, else the
-first ``elf-archive/`` holding an index (ours, not group/world-writable) in the cwd
-or its parents up to the git repo root, then likewise from this script (reaching
-the superproject when vendored), else ``./elf-archive``.
+first ``elf-archive/`` holding an index (ours, not group/world-writable) in the main
+checkout behind a git worktree, then in the cwd or its parents up to the git repo
+root, then likewise from this script (reaching the superproject when vendored),
+else the main checkout's ``elf-archive/`` (a worktree never starts its own), else
+``./elf-archive``.
 
 Retention keeps the ``$ELF_ARCHIVE_KEEP`` (30) most recently flashed builds plus
 the last ``$ELF_ARCHIVE_KEEP_PER_DEVICE`` (3) builds of every device.
@@ -81,14 +83,41 @@ def _trusted(path):
     return st.st_uid == os.getuid() and not st.st_mode & 0o022
 
 
+def _main_checkout(start):
+    """Main working tree behind the git worktree holding `start`, else None."""
+    for p in _repo_dirs(start):
+        g = os.path.join(p, '.git')
+        if not os.path.isfile(g):
+            continue
+        try:
+            line = open(g).read().strip()
+        except OSError:
+            return None
+        if line.startswith('gitdir:') and '/worktrees/' in line:
+            gd = os.path.normpath(os.path.join(p, line[7:].strip()))
+            common = gd[:gd.rindex('/worktrees/')]
+            if common.endswith('/.git'):
+                return os.path.dirname(common)
+            if '/.git/modules/' in common:
+                return common.replace('/.git/modules/', '/', 1)
+    return None
+
+
 def _find_archive_dir(starts=None):
-    """First `elf-archive/` holding an index in the repo of the cwd or of this
-    script (owned by us, not group/world-writable), else ./elf-archive."""
+    """First `elf-archive/` holding an index (owned by us, not group/world-writable)
+    in the main checkout behind a git worktree, then in the repo of the cwd or of
+    this script; else the main checkout's, else ./elf-archive. A worktree never
+    starts an archive of its own."""
     starts = starts or [os.getcwd(), os.path.dirname(os.path.abspath(__file__))]
-    for base in [d for st in starts for d in _repo_dirs(st)]:
+    mains = [m for m in (_main_checkout(st) for st in starts) if m]
+    for base in [d for st in mains + starts for d in _repo_dirs(st)]:
         d = os.path.join(base, 'elf-archive')
         idx = os.path.join(d, 'index.jsonl')
         if os.path.exists(idx) and _trusted(d) and _trusted(idx):
+            return d
+    for m in mains:  # only a main checkout that exists and is ours, with no untrusted archive
+        d = os.path.join(m, 'elf-archive')
+        if os.path.isdir(m) and _trusted(m) and (not os.path.exists(d) or _trusted(d)):
             return d
     return os.path.join(os.getcwd(), 'elf-archive')
 

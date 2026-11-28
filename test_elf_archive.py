@@ -181,6 +181,51 @@ class ElfArchiveTest(unittest.TestCase):
         os.makedirs(x)
         self.assertEqual(self._find_from(x), os.path.realpath(os.path.join(x, "elf-archive")))
 
+    def _worktree(self):
+        main, _ = self._repo()
+        wt = os.path.join(self.tmp, "wt")
+        os.makedirs(wt)
+        open(os.path.join(wt, ".git"), "w").write(f"gitdir: {main}/.git/worktrees/wt\n")
+        return main, wt
+
+    def test_find_archive_dir_worktree_uses_main_checkout(self):
+        main, wt = self._worktree()
+        arch = self._arch(main)
+        self._arch(wt)  # a stray archive a worktree started before the fix
+        self.assertEqual(self._find_from(wt), arch)
+
+    def test_find_archive_dir_worktree_never_starts_its_own(self):
+        main, wt = self._worktree()
+        self.assertEqual(self._find_from(wt), os.path.realpath(os.path.join(main, "elf-archive")))
+
+    def test_find_archive_dir_relative_gitdir(self):
+        main, wt = self._worktree()
+        arch = self._arch(main)
+        sub = os.path.join(wt, "etc", "tool")
+        os.makedirs(sub)
+        open(os.path.join(sub, ".git"), "w").write("gitdir: ../../../proj/.git/worktrees/wt/modules/etc/tool\n")
+        self.assertEqual(self._find_from(sub), arch)
+
+    def test_find_archive_dir_untrusted_main_not_used(self):
+        main, wt = self._worktree()
+        self._arch(main, 0o777)
+        self.assertEqual(self._find_from(wt), os.path.realpath(os.path.join(wt, "elf-archive")))
+
+    def test_find_archive_dir_missing_main_not_used(self):
+        wt = os.path.join(self.tmp, "wt2")
+        os.makedirs(wt)
+        open(os.path.join(wt, ".git"), "w").write(f"gitdir: {self.tmp}/gone/.git/worktrees/wt2\n")
+        self.assertEqual(self._find_from(wt), os.path.realpath(os.path.join(wt, "elf-archive")))
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "gone")))
+
+    def test_find_archive_dir_submodule_of_worktree(self):
+        main, wt = self._worktree()
+        arch = self._arch(main)
+        sub = os.path.join(wt, "etc", "tool")
+        os.makedirs(sub)
+        open(os.path.join(sub, ".git"), "w").write(f"gitdir: {main}/.git/worktrees/wt/modules/etc/tool\n")
+        self.assertEqual(self._find_from(sub), arch)
+
     def test_find_archive_dir_skips_writable(self):
         root, sub = self._repo("a")
         self._arch(root, 0o777)
